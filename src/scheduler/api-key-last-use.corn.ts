@@ -44,21 +44,27 @@ export class ApiKeyUsageCron {
 
     if (entries.length === 0) return;
 
+
+
     const valuesSql = sql.join(
-      entries.map((entry) => sql`(${entry.keyId}::uuid, ${entry.ts})`),
+      entries.map(
+        (entry) => sql`(${entry.keyId}::uuid, ${entry.ts}::timestamptz)`,
+      ),
       sql`,`,
     );
 
     await this.db.execute(sql`
-        UPDATE api_key AS ak
-        SET last_used_at = GREATEST(
-                COALESCE(ak.last_used_at, v.ts),
-                v.ts
-                           )
-            FROM (
+      UPDATE api_key AS ak
+      SET last_used_at = GREATEST(
+        COALESCE(ak.last_used_at, v.ts),
+        v.ts
+                         )
+        FROM (
         VALUES ${valuesSql}
-            ) AS v(id, ts)
-        WHERE ak.id = v.id
+        ) AS v(id, ts)
+      WHERE ak.id = v.id
     `);
+
+
   }
 }

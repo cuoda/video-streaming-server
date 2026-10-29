@@ -2,7 +2,6 @@ import {
   Controller,
   Get,
   Post,
-  Body,
   Param,
   Delete,
   Req,
@@ -41,8 +40,8 @@ export class ApiKeyController {
   @ApiOperation({
     summary: 'API keys last used',
   })
-  async apiKeyLastUsed(@Param('id') id: string): Promise<any> {
-    return this.apiKeyService.getApiKeyLastUsed(id);
+  async apiKeyLastUsed(@Req() req: any, @Param('id') id: string): Promise<any> {
+    return this.apiKeyService.getApiKeyLastUsed(req.user?.id, id);
   }
 
   @Delete(':id')

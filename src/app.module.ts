@@ -6,6 +6,8 @@ import { DatabaseModule } from './database/database.module';
 import { RedisModule, CacheModule } from './infra';
 import { ScheduleModule } from '@nestjs/schedule';
 import { ApiKeyUsageCron } from './scheduler/api-key-last-use.corn';
+import { ApiKeyController } from './controller/api-key.controller';
+import { ApiKeyService } from './services/api-key.service';
 
 @Module({
   imports: [
@@ -15,7 +17,7 @@ import { ApiKeyUsageCron } from './scheduler/api-key-last-use.corn';
     CacheModule,
     RedisModule,
   ],
-  controllers: [AppController],
-  providers: [AppService, ApiKeyUsageCron],
+  controllers: [AppController, ApiKeyController],
+  providers: [AppService, ApiKeyUsageCron, ApiKeyService],
 })
 export class AppModule {}

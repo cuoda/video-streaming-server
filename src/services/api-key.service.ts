@@ -1,18 +1,22 @@
 import { BadRequestException, Inject, Injectable } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { randomBytes } from 'crypto';
-import { count, eq, and } from 'drizzle-orm';
+import { and, count, eq, isNull } from 'drizzle-orm';
 import { DRIZZLE_DB } from 'src/database/database.module';
 import { api_key } from 'src/database/schema';
 import * as argon2 from 'argon2';
-import { last } from 'rxjs';
 import { REDIS_CLIENT } from 'src/infra';
 import Redis from 'ioredis';
 import { LAST_USED_HASH, VERSION } from 'src/configs/constant-global';
-import { CachedKey } from 'src/guards/clerk.guard';
-import { LRUCache } from 'lru-cache';
 
-const localCache = new LRUCache<string, CachedKey>({ max: 100_000 });
+type ApiKeyListItem = {
+  id: string;
+  keyId: string;
+  prefix: string;
+  createdAt: Date | string | null;
+  lastUsedAt: Date | string | null;
+  revokedAt: Date | string | null;
+};
 
 @Injectable()
 export class ApiKeyService {
@@ -21,19 +25,50 @@ export class ApiKeyService {
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
   ) {}
 
-  private generateKey(): { plaintextkey: string; keyId: string } {
-    const keyId = crypto.randomUUID().replace(/-/g, '');
+  private toCanonicalUuid(keyId: string): string {
+    const compactId = keyId.replace(/-/g, '');
+
+    if (!/^[0-9a-fA-F]{32}$/.test(compactId)) {
+      return keyId;
+    }
+
+    return [
+      compactId.slice(0, 8),
+      compactId.slice(8, 12),
+      compactId.slice(12, 16),
+      compactId.slice(16, 20),
+      compactId.slice(20, 32),
+    ]
+      .join('-')
+      .toLowerCase();
+  }
+
+  private generateKey(): {
+    plaintextkey: string;
+    compactKeyId: string;
+    dbKeyId: string;
+  } {
+    const dbKeyId = crypto.randomUUID();
+    const compactKeyId = dbKeyId.replace(/-/g, '');
     const secret = randomBytes(32).toString('base64url');
-    const plaintextkey = `VMX_${keyId}_${secret}`;
-    return { plaintextkey, keyId };
+    const plaintextkey = `VMX_${compactKeyId}_${secret}`;
+
+    return {
+      plaintextkey,
+      compactKeyId,
+      dbKeyId,
+    };
   }
 
   async createApiKey(userId: string) {
-    // Enforce user to have only 5 api keys
+    if (!userId) {
+      throw new BadRequestException('User ID is required.');
+    }
+
     const [result] = await this.db
       .select({ count: count() })
       .from(api_key)
-      .where(eq(api_key.user_id, userId));
+      .where(and(eq(api_key.user_id, userId), isNull(api_key.revoked_at)));
 
     if (result.count >= 5) {
       throw new BadRequestException(
@@ -41,7 +76,7 @@ export class ApiKeyService {
       );
     }
 
-    const { plaintextkey, keyId } = this.generateKey();
+    const { plaintextkey, dbKeyId } = this.generateKey();
     const hash = await argon2.hash(plaintextkey, {
       type: argon2.argon2id,
       timeCost: 3,
@@ -52,40 +87,93 @@ export class ApiKeyService {
     const prefix = plaintextkey.substring(0, 18) + '...';
 
     await this.db.insert(api_key).values({
-      id: keyId,
+      id: dbKeyId,
       user_id: userId,
-      prefix: prefix,
+      prefix,
       value: hash,
     });
 
     return { key: plaintextkey };
   }
 
-  async listApiKeys(userId: string): Promise<any> {
-    return await this.db
+  async listApiKeys(userId: string): Promise<ApiKeyListItem[]> {
+    if (!userId) {
+      throw new BadRequestException('User ID is required.');
+    }
+
+    const keys: ApiKeyListItem[] = await this.db
       .select({
         id: api_key.id,
+        keyId: api_key.id,
         prefix: api_key.prefix,
-        created_at: api_key.created_at,
-        last_used_at: api_key.last_used_at,
-        revoked_at: api_key.revoked_at,
+        createdAt: api_key.created_at,
+        lastUsedAt: api_key.last_used_at,
+        revokedAt: api_key.revoked_at,
       })
       .from(api_key)
-      .where(and(eq(api_key.user_id, userId)));
+      .where(and(eq(api_key.user_id, userId), isNull(api_key.revoked_at)));
+
+    if (keys.length === 0) {
+      return keys;
+    }
+
+    const redisLastUsedValues: Array<string | null> = await this.redis.hmget(
+      LAST_USED_HASH,
+      ...keys.map((key: ApiKeyListItem) => key.id),
+    );
+
+    return keys.map((key: ApiKeyListItem, index: number): ApiKeyListItem => {
+      const redisValue = redisLastUsedValues[index];
+
+      if (!redisValue) {
+        return key;
+      }
+
+      const redisDate = new Date(Number(redisValue));
+
+      if (Number.isNaN(redisDate.getTime())) {
+        return key;
+      }
+
+      const dbLastUsedAt =
+        key.lastUsedAt === null ? null : new Date(key.lastUsedAt);
+
+      return {
+        ...key,
+        lastUsedAt:
+          dbLastUsedAt === null || redisDate > dbLastUsedAt
+            ? redisDate
+            : key.lastUsedAt,
+      };
+    });
   }
 
   async deleteApiKeys(userId: string, keyId: string) {
+    if (!userId) {
+      throw new BadRequestException('User ID is required.');
+    }
+
+    const normalizedKeyId = this.toCanonicalUuid(keyId);
+
     await this.db
       .update(api_key)
       .set({ revoked_at: new Date() })
-      .where(and(eq(api_key.user_id, userId), eq(api_key.id, keyId)));
+      .where(and(eq(api_key.user_id, userId), eq(api_key.id, normalizedKeyId)));
 
-    await this.redis.del(`vmx:api_key:${VERSION}:${keyId}`);
-    localCache.delete(`${VERSION}:${keyId}`);
+    await this.redis.del(`vmx:api_key:${VERSION}:${normalizedKeyId}`);
+    await this.redis.hdel(LAST_USED_HASH, normalizedKeyId);
+
+    return { success: true };
   }
 
   async regenerateApiKey(userId: string, keyId: string) {
-    const { plaintextkey, keyId: newKeyId } = this.generateKey();
+    if (!userId) {
+      throw new BadRequestException('User ID is required.');
+    }
+
+    const oldKeyId = this.toCanonicalUuid(keyId);
+    const { plaintextkey, dbKeyId } = this.generateKey();
+
     const hash = await argon2.hash(plaintextkey, {
       type: argon2.argon2id,
       timeCost: 3,
@@ -98,34 +186,45 @@ export class ApiKeyService {
     await this.db
       .update(api_key)
       .set({
-        id: newKeyId,
+        id: dbKeyId,
         value: hash,
-        prefix: prefix,
+        prefix,
         created_at: new Date(),
+        last_used_at: null,
       })
-      .where(and(eq(api_key.user_id, userId), eq(api_key.id, keyId)));
+      .where(and(eq(api_key.user_id, userId), eq(api_key.id, oldKeyId)));
+
+    await this.redis.del(`vmx:api_key:${VERSION}:${oldKeyId}`);
+    await this.redis.del(`vmx:api_key:${VERSION}:${dbKeyId}`);
+    await this.redis.hdel(LAST_USED_HASH, oldKeyId);
 
     return { key: plaintextkey };
   }
 
-  async getApiKeyLastUsed(keyId: string) {
-    const redisValue = await this.redis.hget(LAST_USED_HASH, keyId);
+  async getApiKeyLastUsed(userId: string, keyId: string) {
+    if (!userId) {
+      throw new BadRequestException('User ID is required.');
+    }
 
-    if (redisValue) {
+    const normalizedKeyId = this.toCanonicalUuid(keyId);
+    const redisValue = await this.redis.hget(LAST_USED_HASH, normalizedKeyId);
+
+    if (redisValue !== null) {
       return {
-        last_used_at: new Date(Number(redisValue)),
+        lastUsedAt: new Date(Number(redisValue)),
       };
     }
 
     const record = await this.db.query.api_key.findFirst({
-      where: (ak: typeof api_key) => eq(ak.id, keyId),
+      where: (ak: typeof api_key) =>
+        and(eq(ak.id, normalizedKeyId), eq(ak.user_id, userId)),
       columns: {
         last_used_at: true,
       },
     });
 
-    const lastUsedAt: Date | null = record?.last_used_at ?? null;
-
-    return lastUsedAt;
+    return {
+      lastUsedAt: record?.last_used_at ?? null,
+    };
   }
 }
